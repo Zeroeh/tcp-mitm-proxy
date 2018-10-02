@@ -19,7 +19,6 @@ type ProxyConnections struct {
 	ClientPacket Packet
 	cChan chan Packet
 	sChan chan Packet
-	Outgoing *Cipher
 }
 
 func StartListener() {
@@ -112,11 +111,6 @@ func (p *ProxyConnections)Sender(data []byte, code int) {
 	case 2: //server
 		p.ClientHandle.Write(data)
 	}
-}
-
-func (p *ProxyConnections)decrypto(data []byte) {
-	p.Outgoing.XorKeyStreamGeneric(data[5:p.ClientPacket.Length], data[5:p.ClientPacket.Length])
-	fmt.Println("Decrypted:", data)
 }
 
 func StartPolicyListener() {
