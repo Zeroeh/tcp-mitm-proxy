@@ -1,137 +1,165 @@
 package main
 
-
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"net"
+	"runtime"
+	"strings"
+	"time"
 )
+
+//GameConnection is the base connection to the server and client
+type GameConnection struct {
+	InLoop       bool
+	Running      bool
+	Killed       bool
+	SocketDebug  bool
+	DidLogin     bool
+	Phase        int
+	LocalHandle  net.Conn
+	RemoteHandle net.Conn
+	LocalSocket  *bufio.ReadWriter
+	RemoteSocket *bufio.ReadWriter
+}
 
 var (
-	serverIP = "54.234.151.78:2050"
-	eusouth = "52.47.150.186:2050"
+	remoteHost   string
+	remotePort   string
+	localAddress = "127.0.0.1"
+	useSocks     = false
 )
 
-type ProxyConnections struct {
-	ClientHandle net.Conn
-	ServerHandle net.Conn
-	ServerPacket Packet
-	ClientPacket Packet
-	cChan chan Packet
-	sChan chan Packet
-	Outgoing *Cipher
-}
-
-func StartListener() {
-	log.Println("Starting listeners...")
-	lConn, err := net.Listen("tcp", "127.0.0.1:2050")
-	proxy := ProxyConnections{}
-	
-	go StartPolicyListener()
-	if err != nil {
-		fmt.Println("Failure starting listener conn:", err)
-	}
-	log.Println("Listener Started!")
-	cConn, err := lConn.Accept()
-	if err != nil {
-		fmt.Println("Failure accepting client:", err)
-	}
-	proxy.ClientHandle = cConn
-	sConn, err := net.Dial("tcp", serverIP) //change server ip here
-	if err != nil {
-		fmt.Println("Error dialing server:", err)
-	}
-	proxy.ServerHandle = sConn
-	fmt.Println("Connected to", sConn.RemoteAddr())
-	proxy.cChan = make(chan Packet)
-	proxy.sChan = make(chan Packet)
-	go func() {
-		for {
-			proxy.ClientPacket = NewPacket()
-			byteRead, _ := proxy.ClientHandle.Read(proxy.ClientPacket.Data)
-			_ = byteRead
-			proxy.ClientPacket.Length = int(proxy.ClientPacket.ReadUInt32())
-			if proxy.ClientPacket.Length <= packetSize { //cut packet down to size
-				proxy.ClientPacket.Data = proxy.ClientPacket.Data[:proxy.ClientPacket.Length]
-			} else {
-				fmt.Println("Got big packet!")
-				fmt.Println(proxy.ClientPacket.Data[0:4])
-			}
-			fmt.Printf("Client packet size is %d\n", proxy.ClientPacket.Length)
-			//proxy.ClientPacket.Data = proxy.ClientPacket.Data[:proxy.ClientPacket.Length]
-			proxy.cChan <- proxy.ClientPacket //tell it that we are ready
-		}
-		
-	}()
-	go func() {
-		for {
-			proxy.ServerPacket = NewPacket()
-			firstRead, _ := proxy.ServerHandle.Read(proxy.ServerPacket.Data[0:5])
-			_ = firstRead
-			proxy.ServerPacket.Length = int(proxy.ServerPacket.ReadUInt32())
-			if proxy.ServerPacket.Length <= packetSize { //cut packet down to size
-				proxy.ServerPacket.Data = proxy.ServerPacket.Data[:proxy.ServerPacket.Length]
-			} else {
-				fmt.Println("Got big packet!")
-			}
-			byteIndex := 0
-			for byteIndex != proxy.ServerPacket.Length-5 { //loop until we have ALL of the packet bytes in the buffer
-				secondRead, _ := proxy.ServerHandle.Read(proxy.ServerPacket.Data[byteIndex+5:proxy.ServerPacket.Length])
-				byteIndex += secondRead
-			}
-
-			fmt.Printf("Server packet size is %d\n", proxy.ServerPacket.Length)
-			//proxy.ServerPacket.Data = proxy.ServerPacket.Data[:proxy.ServerPacket.Length]
-			proxy.sChan <- proxy.ServerPacket //tell it that we are ready
-		}
-		
-	}()
+//ConnectionLoop is the main loop for reading from the sockets
+func (g *GameConnection) ConnectionLoop() {
 	for {
-		proxy.Balancer()
-	}
-	
-}
+		if g.Killed == false && g.Running == false {
+			g.Running = true
 
-func (p *ProxyConnections)Balancer() {
-	select { //this is where we will decrypt data
-	case data := <-p.cChan:
-		fmt.Println("Client:", data.Data[data.Index:data.Length])
-		p.ServerHandle.Write(data.Data[data.Index:data.Length])
-	case data := <-p.sChan:
-		fmt.Println("Server:", data.Data[:data.Length])
-		p.ClientHandle.Write(data.Data[:data.Length])
-	//default:
-	//	fmt.Println("default")
+			if g.InLoop == false {
+				g.InLoop = true
+				go g.Receive(g.LocalSocket, true)
+				go g.Receive(g.RemoteSocket, false)
+			}
+		} else {
+			time.Sleep(30 * time.Second)
+		}
 	}
 }
 
-func (p *ProxyConnections)Sender(data []byte, code int) {
-	switch code {
-	case 1: //client
-		p.ServerHandle.Write(data)
-	case 2: //server
-		p.ClientHandle.Write(data)
+//Receive reads from the socket
+func (g *GameConnection) Receive(c *bufio.ReadWriter, isLocal bool) {
+	for g.Running == true {
+		recbuf := make([]byte, 1028)
+		bytesRead, err := c.Read(recbuf)
+		if err != nil {
+			log.Println("Error reading:", err)
+			if strings.Contains(err.Error(), "EOF") == true {
+				g.InLoop = false
+				g.Running = false
+			}
+			return
+		}
+		fmt.Println(recbuf[:bytesRead])
+
+		//send out
+		p := new(Packet)
+		p.Data = make([]byte, len(recbuf))
+		p.Data = recbuf[:bytesRead]
+		if isLocal == true {
+			g.Send(g.RemoteSocket, p)
+		} else {
+			g.Send(g.LocalSocket, p)
+		}
 	}
 }
 
-func (p *ProxyConnections)decrypto(data []byte) {
-	p.Outgoing.XorKeyStreamGeneric(data[5:p.ClientPacket.Length], data[5:p.ClientPacket.Length])
-	fmt.Println("Decrypted:", data)
-}
-
-func StartPolicyListener() {
-	lConn, err := net.Listen("tcp", "127.0.0.1:843")
+//Send should be self explantory
+func (g *GameConnection) Send(c *bufio.ReadWriter, p *Packet) {
+	if p == nil {
+		return
+	}
+	if g.SocketDebug == true {
+		fmt.Println("Send:", p.Data)
+	}
+	if c.Reader == nil || c.Writer == nil { //dont write anything if we've disconnected
+		return
+	}
+	_, err := c.Writer.Write(p.Data)
 	if err != nil {
-		fmt.Println("Error listening policy:", err)
+		fmt.Println("Write error:", err)
+		return
 	}
-	cli, err := lConn.Accept()
+	err = c.Flush()
 	if err != nil {
-		fmt.Println("Bad accept policy:", err)
+		fmt.Println("Flush error:", err)
+		return
 	}
-	buffer := make([]byte, 23)
-	cli.Read(buffer)
-	//correct := "3c706f6c6963792d66696c652d726571756573742f3e00"
-	response := []byte{0x3c, 0x3f, 0x78, 0x6d, 0x6c, 0x20, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x3d, 0x22, 0x31, 0x2e, 0x30, 0x22, 0x3f, 0x3e, 0x3c, 0x21, 0x44, 0x4f, 0x43, 0x54, 0x59, 0x50, 0x45, 0x20, 0x63, 0x72, 0x6f, 0x73, 0x73, 0x2d, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x20, 0x53, 0x59, 0x53, 0x54, 0x45, 0x4d, 0x20, 0x22, 0x2f, 0x78, 0x6d, 0x6c, 0x2f, 0x64, 0x74, 0x64, 0x73, 0x2f, 0x63, 0x72, 0x6f, 0x73, 0x73, 0x2d, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x2e, 0x64, 0x74, 0x64, 0x22, 0x3e, 0x20, 0x20, 0x3c, 0x63, 0x72, 0x6f, 0x73, 0x73, 0x2d, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x3e, 0x20, 0x20, 0x3c, 0x73, 0x69, 0x74, 0x65, 0x2d, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x6f, 0x6c, 0x20, 0x70, 0x65, 0x72, 0x6d, 0x69, 0x74, 0x74, 0x65, 0x64, 0x2d, 0x63, 0x72, 0x6f, 0x73, 0x73, 0x2d, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x69, 0x65, 0x73, 0x3d, 0x22, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x2d, 0x6f, 0x6e, 0x6c, 0x79, 0x22, 0x2f, 0x3e, 0x20, 0x20, 0x3c, 0x61, 0x6c, 0x6c, 0x6f, 0x77, 0x2d, 0x61, 0x63, 0x63, 0x65, 0x73, 0x73, 0x2d, 0x66, 0x72, 0x6f, 0x6d, 0x20, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x3d, 0x22, 0x2a, 0x22, 0x20, 0x74, 0x6f, 0x2d, 0x70, 0x6f, 0x72, 0x74, 0x73, 0x3d, 0x22, 0x2a, 0x22, 0x20, 0x2f, 0x3e, 0x3c, 0x2f, 0x63, 0x72, 0x6f, 0x73, 0x73, 0x2d, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x3e, 0x0a, 0x00}
-	cli.Write(response)
-	cli.Close()
+}
+
+func InitListener(g *GameConnection) {
+	lstn, err := net.Listen("tcp", localAddress+":"+remotePort)
+	if err != nil {
+		log.Println("Error starting listener:", err)
+	}
+	for {
+		conn, err := lstn.Accept()
+		if err != nil {
+			log.Println("Error accepting client:", err)
+		}
+		g.WrapSocket(conn, true)
+		InitGameConnection(g)
+		go g.ConnectionLoop()
+	}
+}
+
+//InitGameConnection connects to the server
+func InitGameConnection(g *GameConnection) {
+	if useSocks == true {
+
+	} else {
+		hostIP, err := net.ResolveTCPAddr("tcp", remoteHost+":"+remotePort)
+		if err != nil {
+			log.Println("Error resolving server:", err)
+			return
+		}
+		conn, err := net.DialTCP("tcp", nil, hostIP)
+		if err != nil {
+			log.Println("Error dialing server:", err)
+			return
+		}
+		err = conn.SetNoDelay(true)
+		if err != nil {
+			log.Println("Error setting no delay:", err)
+			//shouldnt have to return since we still have a valid socket
+		}
+		g.WrapSocket(conn, false)
+		log.Println("Dialed server")
+	}
+}
+
+//Kill destroys the connection and cleans up
+func (g *GameConnection) Kill() {
+	g.Killed = true
+	g.InLoop = false
+	g.Running = false
+	g.LocalHandle.Close()
+	g.RemoteHandle.Close()
+	g.LocalSocket = nil
+	g.RemoteSocket = nil
+	runtime.GC()
+	time.Sleep(1000 * time.Millisecond)
+}
+
+//WrapSocket self explanatory
+func (g *GameConnection) WrapSocket(c net.Conn, isLocal bool) {
+	if isLocal == true {
+		g.LocalHandle = c
+		g.LocalSocket = bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c))
+	} else {
+		g.RemoteHandle = c
+		g.RemoteSocket = bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c))
+	}
+
 }
